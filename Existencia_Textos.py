@@ -6,6 +6,8 @@ import threading
 import io
 import os
 import sys
+import json
+import shutil
 
 # ── Tema ──────────────────────────────────────────────────────────────────────
 ctk.set_appearance_mode("dark")
@@ -39,7 +41,11 @@ def ruta_recurso(rel_path):
         base_path = os.path.abspath(".")
     return os.path.join(base_path, rel_path)
 
-PERFILES = {
+# ── Perfiles persistentes (fuera del .exe, en %APPDATA%) ──────────────────────
+# Se usan para "sembrar" perfiles.json la primera vez que la app corre en un PC.
+# Después de eso, todo alta/edición de perfil se guarda en %APPDATA% y estos
+# valores ya no se vuelven a leer.
+PERFILES_DEFAULT = {
     "600438": {"nombre": "Sebastian Ochoa",  "firma": "600438_firma.png"},
     "442630": {"nombre": "Valeria Luque",    "firma": "442630_firma.png"},
     "151378": {"nombre": "Diana Palacios",   "firma": "151378_firma.png"},
@@ -48,24 +54,89 @@ PERFILES = {
     "600445": {"nombre": "Mathias Sotelo",   "firma": "600445_firma.png"},
 }
 
+def ruta_datos_usuario():
+    """Carpeta persistente fuera del .exe (sys._MEIPASS es de solo lectura)."""
+    base = os.getenv("APPDATA", os.path.expanduser("~"))
+    carpeta = os.path.join(base, "StockControl")
+    os.makedirs(os.path.join(carpeta, "Firmas"), exist_ok=True)
+    return carpeta
+
+def ruta_perfiles_json():
+    return os.path.join(ruta_datos_usuario(), "perfiles.json")
+
+def cargar_perfiles():
+    """Carga perfiles.json; si no existe, lo siembra con los perfiles por defecto
+    (copiando también sus firmas desde el recurso empaquetado, si están)."""
+    ruta = ruta_perfiles_json()
+    if not os.path.exists(ruta):
+        perfiles_sembrados = {}
+        for codigo, datos in PERFILES_DEFAULT.items():
+            origen = ruta_recurso(os.path.join("Firmas", datos["firma"]))
+            destino = os.path.join(ruta_datos_usuario(), "Firmas", datos["firma"])
+            if os.path.exists(origen):
+                try:
+                    shutil.copy(origen, destino)
+                except Exception:
+                    pass
+            perfiles_sembrados[codigo] = {"nombre": datos["nombre"], "firma": destino}
+        with open(ruta, "w", encoding="utf-8") as f:
+            json.dump(perfiles_sembrados, f, ensure_ascii=False, indent=2)
+        return perfiles_sembrados
+    with open(ruta, "r", encoding="utf-8") as f:
+        return json.load(f)
+
+def guardar_perfiles(perfiles):
+    with open(ruta_perfiles_json(), "w", encoding="utf-8") as f:
+        json.dump(perfiles, f, ensure_ascii=False, indent=2)
+
+def agregar_perfil(codigo, nombre, ruta_imagen_firma):
+    """Agrega o edita un perfil: copia la firma a la carpeta persistente y
+    guarda el registro en perfiles.json. Devuelve el diccionario actualizado."""
+    perfiles = cargar_perfiles()
+    _, ext = os.path.splitext(ruta_imagen_firma)
+    destino = os.path.join(ruta_datos_usuario(), "Firmas", f"{codigo}_firma{ext or '.png'}")
+    shutil.copy(ruta_imagen_firma, destino)
+    perfiles[codigo] = {"nombre": nombre, "firma": destino}
+    guardar_perfiles(perfiles)
+    global PERFILES
+    PERFILES = perfiles
+    return perfiles
+
+def eliminar_perfil(codigo):
+    perfiles = cargar_perfiles()
+    if codigo in perfiles:
+        del perfiles[codigo]
+        guardar_perfiles(perfiles)
+    global PERFILES
+    PERFILES = perfiles
+    return perfiles
+
+# Se carga una vez al iniciar el módulo; el resto del programa lee de PERFILES.
+PERFILES = cargar_perfiles()
+
 libros_detectados = []
 faltantes_dict    = {}
 botones_libros    = {}
 frames_libros     = {}
+combo_perfiles    = None
 
 
-def agregar_firma_y_nombre(can, perfil_id):
+def agregar_firma_y_nombre(can, perfil_id, y_firma=325):
     perfil = PERFILES.get(perfil_id)
     if not perfil:
         return
     nombre     = perfil["nombre"]
-    ruta_firma = ruta_recurso(os.path.join("Firmas", perfil["firma"]))
+    ruta_firma = perfil["firma"]
+    # Compatibilidad: si "firma" es solo un nombre de archivo (perfil viejo),
+    # se busca en el recurso empaquetado; si es una ruta absoluta, se usa tal cual.
+    if not os.path.isabs(ruta_firma):
+        ruta_firma = ruta_recurso(os.path.join("Firmas", ruta_firma))
     can.setFillColor(colors_mod.black)
     can.setFont("Helvetica", 15)
-    can.drawString(350, 325, nombre)
+    can.drawString(350, y_firma, nombre)
     if os.path.exists(ruta_firma):
         firma_img = ImageReader(ruta_firma)
-        can.drawImage(firma_img, 470, 325, width=120, height=40, mask='auto')
+        can.drawImage(firma_img, 470, y_firma, width=120, height=40, mask='auto')
 
 def obtener_filas_con_erp(ruta_pdf):
     filas = []
@@ -84,6 +155,20 @@ def obtener_filas_con_erp(ruta_pdf):
             if erp in posiciones:
                 filas.append({"erp": erp, "descripcion": descripcion, "y": posiciones[erp], "total": total})
     return filas
+
+def obtener_y_firma(ruta_pdf):
+    """Ubica la posición real de la línea 'Nombre y Firma' en el PDF fuente,
+    para no depender de un cálculo por cantidad de filas. Si no la encuentra,
+    devuelve None y el llamador debe usar un valor por defecto."""
+    with pdfplumber.open(ruta_pdf) as pdf:
+        pagina   = pdf.pages[0]
+        palabras = pagina.extract_words()
+        for palabra in palabras:
+            if palabra["text"] in ("Firma", "Nombre"):
+                # +12 aprox. para que el nombre/firma queden pegados encima
+                # de la línea de guiones, con el mismo criterio siempre.
+                return (835 - palabra["top"]) + 16
+    return None
 
 def escribir_sobre_pdf(ruta_pdf, salida_pdf, excepciones, perfil_id, comentario):
     filas  = obtener_filas_con_erp(ruta_pdf)
@@ -126,7 +211,10 @@ def escribir_sobre_pdf(ruta_pdf, salida_pdf, excepciones, perfil_id, comentario)
                 can.drawString(20, y, linea)
                 y -= 12
 
-    agregar_firma_y_nombre(can, perfil_id)
+    y_firma = obtener_y_firma(ruta_pdf)
+    if y_firma is None:
+        y_firma = 325  # fallback por si el formato del PDF cambia y no se detecta la línea
+    agregar_firma_y_nombre(can, perfil_id, y_firma)
     can.save()
     packet.seek(0)
 
@@ -206,6 +294,109 @@ def mostrar_input(libro, frame_item):
 
     entry.bind("<Return>", guardar)
     entry.focus()
+
+def abrir_config_perfiles():
+    """Ventana para agregar/editar/eliminar perfiles (código, nombre, firma)."""
+    win = ctk.CTkToplevel()
+    win.title("Perfiles")
+    win.geometry("420x430")
+    win.grab_set()  # modal sobre la ventana principal
+
+    ctk.CTkLabel(win, text="Perfiles", font=ctk.CTkFont(size=16, weight="bold")).pack(
+        pady=(20, 4), padx=20, anchor="w")
+    ctk.CTkLabel(
+        win, text="Agrega o edita un asesor. El código es el mismo que se usa como Usuario en Campus.",
+        font=ctk.CTkFont(size=11), text_color=("gray45", "gray60"), wraplength=380, justify="left",
+    ).pack(padx=20, anchor="w")
+
+    frame_form = ctk.CTkFrame(win, corner_radius=12)
+    frame_form.pack(fill="x", padx=20, pady=16)
+    frame_form.grid_columnconfigure(0, weight=1)
+
+    entry_codigo = ctk.CTkEntry(frame_form, placeholder_text="Código (ej: 600438)", height=36)
+    entry_codigo.grid(row=0, column=0, sticky="ew", padx=16, pady=(16, 8))
+    entry_nombre = ctk.CTkEntry(frame_form, placeholder_text="Nombre completo", height=36)
+    entry_nombre.grid(row=1, column=0, sticky="ew", padx=16, pady=(0, 8))
+
+    lbl_firma_sel = ctk.CTkLabel(frame_form, text="Sin imagen seleccionada",
+                                  font=ctk.CTkFont(size=11), text_color=("gray50", "gray50"))
+    ruta_firma_elegida = {"valor": None}
+
+    def elegir_firma():
+        ruta = filedialog.askopenfilename(
+            title="Seleccionar imagen de firma",
+            filetypes=[("Imágenes", "*.png *.jpg *.jpeg")],
+        )
+        if ruta:
+            ruta_firma_elegida["valor"] = ruta
+            lbl_firma_sel.configure(text=os.path.basename(ruta))
+
+    ctk.CTkButton(frame_form, text="Elegir imagen de firma…", height=36,
+                  fg_color="transparent", border_width=1,
+                  command=elegir_firma).grid(row=2, column=0, sticky="ew", padx=16, pady=(0, 4))
+    lbl_firma_sel.grid(row=3, column=0, sticky="w", padx=16, pady=(0, 16))
+
+    def guardar():
+        global PERFILES
+        codigo = entry_codigo.get().strip()
+        nombre = entry_nombre.get().strip()
+        firma  = ruta_firma_elegida["valor"]
+        if not codigo or not nombre:
+            messagebox.showerror("Error", "Ingrese código y nombre", parent=win)
+            return
+        if not firma and codigo not in PERFILES:
+            messagebox.showerror("Error", "Seleccione una imagen de firma", parent=win)
+            return
+        if firma:
+            agregar_perfil(codigo, nombre, firma)
+        else:
+            # Se editó nombre sin cambiar la firma existente
+            perfiles = cargar_perfiles()
+            perfiles[codigo]["nombre"] = nombre
+            guardar_perfiles(perfiles)
+            PERFILES = perfiles
+        refrescar_lista()
+        refrescar_combo_perfiles()
+        entry_codigo.delete(0, "end")
+        entry_nombre.delete(0, "end")
+        ruta_firma_elegida["valor"] = None
+        lbl_firma_sel.configure(text="Sin imagen seleccionada")
+
+    ctk.CTkButton(frame_form, text="Guardar perfil", height=38,
+                  command=guardar).grid(row=4, column=0, sticky="ew", padx=16, pady=(0, 16))
+
+    ctk.CTkLabel(win, text="PERFILES EXISTENTES", font=ctk.CTkFont(size=10, weight="bold"),
+                 text_color=("gray50", "gray50")).pack(padx=20, anchor="w")
+    frame_lista = ctk.CTkScrollableFrame(win, height=140)
+    frame_lista.pack(fill="both", expand=True, padx=20, pady=(4, 20))
+
+    def refrescar_lista():
+        for w in frame_lista.winfo_children():
+            w.destroy()
+        for codigo, datos in PERFILES.items():
+            fila = ctk.CTkFrame(frame_lista, fg_color="transparent")
+            fila.pack(fill="x", pady=2)
+            ctk.CTkLabel(fila, text=f"{codigo} — {datos['nombre']}",
+                         font=ctk.CTkFont(size=12)).pack(side="left")
+
+            def hacer_eliminar(cod=codigo):
+                if messagebox.askyesno("Confirmar", f"¿Eliminar el perfil {cod}?", parent=win):
+                    eliminar_perfil(cod)
+                    refrescar_lista()
+                    refrescar_combo_perfiles()
+
+            ctk.CTkButton(fila, text="Eliminar", width=70, height=24,
+                          fg_color="#7f1d1d", hover_color="#991b1b",
+                          command=hacer_eliminar).pack(side="right")
+
+    refrescar_lista()
+
+def refrescar_combo_perfiles():
+    if combo_perfiles is not None:
+        combo_perfiles.configure(values=list(PERFILES.keys()))
+        if combo_perfiles.get() not in PERFILES:
+            valores = list(PERFILES.keys())
+            combo_perfiles.set(valores[0] if valores else "")
 
 def actualizar_turno_botones():
     seleccionado = turno_var.get()
@@ -356,11 +547,13 @@ def construir_ventana_principal():
     ctk.CTkFrame(sidebar, height=1, fg_color=("gray75", "gray30")).grid(
         row=2, column=0, sticky="ew", padx=16)
 
+    comandos_sidebar = {"Config": abrir_config_perfiles}
     for idx, (icon, label) in enumerate([("📄", "Reporte"), ("📚", "Libros"), ("⚙️", "Config")]):
         ctk.CTkButton(
             sidebar, text=f"  {icon}  {label}", anchor="w",
             fg_color="transparent", text_color=("gray20", "gray80"),
             hover_color=("gray88", "gray25"), corner_radius=8, height=40,
+            command=comandos_sidebar.get(label),
         ).grid(row=3 + idx, column=0, padx=10, pady=2, sticky="ew")
 
     ctk.CTkLabel(sidebar, text="v1.0", font=ctk.CTkFont(size=11),
