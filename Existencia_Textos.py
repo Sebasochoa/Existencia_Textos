@@ -299,7 +299,7 @@ def abrir_config_perfiles():
     """Ventana para agregar/editar/eliminar perfiles (código, nombre, firma)."""
     win = ctk.CTkToplevel()
     win.title("Perfiles")
-    win.geometry("1100x860")
+    win.geometry("900x550")
     win.grab_set()
 
     ruta_ico = ruta_recurso("Icono.ico")
@@ -506,6 +506,7 @@ def construir_ventana_principal():
     ventana.title("Sistema Control de Stock")
     ventana.geometry("1100x860")
     ventana.minsize(800, 600)
+    ventana.after(10, lambda: ventana.state("zoomed"))
 
     # Ícono de ventana y barra de tareas
     ruta_ico = ruta_recurso("Icono.ico")
@@ -708,7 +709,6 @@ if __name__ == "__main__":
     def _abrir_app(splash):
         splash.destroy()
         ventana = construir_ventana_principal()
-        ventana.state("zoomed")
         ventana.mainloop()
 
     splash.after(100, esperar_carga)
