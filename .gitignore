@@ -1,0 +1,26 @@
+# Bytecode / cache
+__pycache__/
+*.pyc
+*.pyo
+
+# Entornos virtuales
+.venv/
+venv/
+env/
+
+# Variables de entorno / secretos
+.env
+
+# Archivos de IDE
+.vscode/
+.idea/
+
+# Sistema
+.DS_Store
+
+# Logs
+*.log
+
+*.ico
+*.png
+*.pdf
