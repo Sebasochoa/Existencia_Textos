@@ -299,8 +299,12 @@ def abrir_config_perfiles():
     """Ventana para agregar/editar/eliminar perfiles (código, nombre, firma)."""
     win = ctk.CTkToplevel()
     win.title("Perfiles")
-    win.geometry("420x430")
-    win.grab_set()  # modal sobre la ventana principal
+    win.geometry("1100x860")
+    win.grab_set()
+
+    ruta_ico = ruta_recurso("Icono.ico")
+    if os.path.exists(ruta_ico):
+        win.after(200, lambda: win.iconbitmap(ruta_ico))
 
     ctk.CTkLabel(win, text="Perfiles", font=ctk.CTkFont(size=16, weight="bold")).pack(
         pady=(20, 4), padx=20, anchor="w")
@@ -704,6 +708,7 @@ if __name__ == "__main__":
     def _abrir_app(splash):
         splash.destroy()
         ventana = construir_ventana_principal()
+        ventana.state("zoomed")
         ventana.mainloop()
 
     splash.after(100, esperar_carga)
