@@ -41,17 +41,8 @@ def ruta_recurso(rel_path):
         base_path = os.path.abspath(".")
     return os.path.join(base_path, rel_path)
 
-# ── Perfiles persistentes (fuera del .exe, en %APPDATA%) ──────────────────────
-# Se usan para "sembrar" perfiles.json la primera vez que la app corre en un PC.
-# Después de eso, todo alta/edición de perfil se guarda en %APPDATA% y estos
-# valores ya no se vuelven a leer.
 PERFILES_DEFAULT = {
     "600438": {"nombre": "Sebastian Ochoa",  "firma": "600438_firma.png"},
-    "442630": {"nombre": "Valeria Luque",    "firma": "442630_firma.png"},
-    "151378": {"nombre": "Diana Palacios",   "firma": "151378_firma.png"},
-    "5065":   {"nombre": "Eva Choquepuma",   "firma": "5065_firma.png"},
-    "62842":  {"nombre": "Daneska Urbina",   "firma": "62842_firma.png"},
-    "600445": {"nombre": "Mathias Sotelo",   "firma": "600445_firma.png"},
 }
 
 def ruta_datos_usuario():
@@ -114,11 +105,12 @@ def eliminar_perfil(codigo):
 # Se carga una vez al iniciar el módulo; el resto del programa lee de PERFILES.
 PERFILES = cargar_perfiles()
 
-libros_detectados = []
-faltantes_dict    = {}
-botones_libros    = {}
-frames_libros     = {}
-combo_perfiles    = None
+libros_detectados   = []
+faltantes_dict      = {}
+botones_libros      = {}
+frames_libros       = {}
+combo_perfiles      = None
+combo_perfiles_caja = None
 
 
 def agregar_firma_y_nombre(can, perfil_id, y_firma=325):
@@ -227,6 +219,80 @@ def escribir_sobre_pdf(ruta_pdf, salida_pdf, excepciones, perfil_id, comentario)
     with open(salida_pdf, "wb") as f:
         writer.write(f)
 
+# ── Reporte de Caja (firma) ────────────────────────────────────────────────────
+# Este documento (Reporte de Caja Detallado) es A4 horizontal y, a diferencia de
+# Existencia de Textos, no trae impresa ninguna línea de firma: acá se dibuja el
+# bloque completo (nombre + firma + línea + etiqueta). Como el largo del reporte
+# varía según la cantidad de cobros del día, la posición se ubica dinámicamente
+# al costado del cuadro "RESUMEN FINAL PARA EL ÁREA DE CONTABILIDAD", que siempre
+# está presente y es el punto más fiable de anclar (a diferencia de "Leyenda",
+# que puede quedar muy abajo si el reporte tiene muchas filas).
+
+def obtener_iniciales(nombre):
+    return "".join(p[0].upper() for p in nombre.split() if p)
+
+def obtener_bloque_firma_caja(ruta_pdf):
+    """Ubica el cuadro 'RESUMEN FINAL PARA EL ÁREA DE CONTABILIDAD' en la
+    última página del Reporte de Caja, para poner la firma al costado sin
+    depender de cuánto ocupe el detalle de cobros de arriba. Si no lo
+    encuentra, devuelve None y el llamador usa un fallback."""
+    with pdfplumber.open(ruta_pdf) as pdf:
+        pagina       = pdf.pages[-1]
+        palabras     = pagina.extract_words()
+        top_cabecera = next((p["top"] for p in palabras if p["text"] == "CONTABILIDAD"), None)
+        filas_total  = [p for p in palabras if p["text"] == "TOTAL"]
+        if top_cabecera is None or not filas_total:
+            return None
+        fila_total = max(filas_total, key=lambda p: p["top"])  # la más abajo = la del resumen
+        banda      = [p for p in palabras if top_cabecera - 2 <= p["top"] <= fila_total["bottom"] + 2]
+        x_derecho  = max(p["x1"] for p in banda)
+        return {"x": x_derecho + 20, "y": pagina.height - top_cabecera}
+
+def firmar_reporte_caja(ruta_pdf, salida_pdf, perfil_id):
+    perfil = PERFILES.get(perfil_id)
+    if not perfil:
+        raise ValueError("Perfil no encontrado")
+
+    with pdfplumber.open(ruta_pdf) as pdf:
+        ancho_pagina = pdf.pages[-1].width
+        alto_pagina  = pdf.pages[-1].height
+
+    ancla = obtener_bloque_firma_caja(ruta_pdf)
+    x, y = (ancla["x"], ancla["y"]) if ancla else (ancho_pagina - 200, 120)  # fallback: esq. inf. derecha
+
+    packet = io.BytesIO()
+    can = canvas_mod.Canvas(packet, pagesize=(ancho_pagina, alto_pagina))
+
+    can.setFillColor(colors_mod.black)
+    can.setFont("Helvetica", 9)
+    can.drawString(x, y, perfil["nombre"])
+
+    ruta_firma = perfil["firma"]
+    if not os.path.isabs(ruta_firma):
+        ruta_firma = ruta_recurso(os.path.join("Firmas", ruta_firma))
+    if os.path.exists(ruta_firma):
+        can.drawImage(ImageReader(ruta_firma), x, y - 42, width=110, height=32, mask="auto")
+
+    can.setStrokeColor(colors_mod.black)
+    can.line(x, y - 48, x + 130, y - 48)
+    can.setFont("Helvetica", 7)
+    can.setFillColor(colors_mod.grey)
+    can.drawString(x, y - 58, "Nombre y Firma")
+
+    can.save()
+    packet.seek(0)
+
+    original = PdfReader(ruta_pdf)
+    overlay  = PdfReader(packet)
+    writer   = PdfWriter()
+    ultima   = len(original.pages) - 1
+    for i, pagina in enumerate(original.pages):
+        if i == ultima:
+            pagina.merge_page(overlay.pages[0])
+        writer.add_page(pagina)
+    with open(salida_pdf, "wb") as f:
+        writer.write(f)
+
 # ── Handlers UI ───────────────────────────────────────────────────────────────
 
 def seleccionar_pdf():
@@ -234,6 +300,14 @@ def seleccionar_pdf():
     if ruta:
         entry_pdf.delete(0, "end")
         entry_pdf.insert(0, ruta)
+
+def seleccionar_pdf_generico(entry_destino):
+    """Igual que seleccionar_pdf pero reutilizable para cualquier Entry
+    (la usa la vista de Caja para no duplicar el diálogo de archivo)."""
+    ruta = filedialog.askopenfilename(filetypes=[("PDF files", "*.pdf")])
+    if ruta:
+        entry_destino.delete(0, "end")
+        entry_destino.insert(0, ruta)
 
 def cargar_libros():
     global libros_detectados
@@ -396,11 +470,12 @@ def abrir_config_perfiles():
     refrescar_lista()
 
 def refrescar_combo_perfiles():
-    if combo_perfiles is not None:
-        combo_perfiles.configure(values=list(PERFILES.keys()))
-        if combo_perfiles.get() not in PERFILES:
-            valores = list(PERFILES.keys())
-            combo_perfiles.set(valores[0] if valores else "")
+    for combo in (combo_perfiles, combo_perfiles_caja):
+        if combo is not None:
+            combo.configure(values=list(PERFILES.keys()))
+            if combo.get() not in PERFILES:
+                valores = list(PERFILES.keys())
+                combo.set(valores[0] if valores else "")
 
 def actualizar_turno_botones():
     seleccionado = turno_var.get()
@@ -449,6 +524,49 @@ def generar_pdf():
         text=f"✔  PDF guardado: {os.path.basename(nombre_salida)}",
         text_color="#86efac"
     )
+
+def generar_pdf_caja():
+    if pdfplumber is None:
+        messagebox.showwarning("Espera", "Las librerias aun se estan cargando, intentá en unos segundos.")
+        return
+    ruta_pdf  = entry_pdf_caja.get()
+    perfil_id = combo_perfiles_caja.get()
+    if not ruta_pdf:
+        messagebox.showerror("Error", "Seleccione un PDF")
+        return
+    if perfil_id not in PERFILES:
+        messagebox.showerror("Error", "Seleccione un perfil valido")
+        return
+
+    fecha          = datetime.datetime.now().strftime("%Y%m%d")
+    iniciales      = obtener_iniciales(PERFILES[perfil_id]["nombre"])
+    nombre_default = f"{iniciales} - {fecha}.pdf"
+
+    nombre_salida = filedialog.asksaveasfilename(
+        defaultextension=".pdf",
+        filetypes=[("PDF files", "*.pdf")],
+        initialfile=nombre_default,
+        title="Guardar reporte de caja como",
+    )
+    if not nombre_salida:
+        return
+
+    firmar_reporte_caja(ruta_pdf, nombre_salida, perfil_id)
+    lbl_status_caja.configure(
+        text=f"✔  PDF guardado: {os.path.basename(nombre_salida)}",
+        text_color="#86efac"
+    )
+
+def mostrar_vista(nombre):
+    """Alterna entre la vista de Existencia de Textos y la de Caja dentro
+    del mismo panel scrollable (mismo lugar en el grid, se oculta la que
+    no corresponde)."""
+    if nombre == "Caja":
+        frame_vista_reporte.grid_remove()
+        frame_vista_caja.grid(row=0, column=0, sticky="nsew")
+    else:
+        frame_vista_caja.grid_remove()
+        frame_vista_reporte.grid(row=0, column=0, sticky="nsew")
 
 
 # ── SPLASH SCREEN ─────────────────────────────────────────────────────────────
@@ -501,6 +619,8 @@ def construir_ventana_principal():
     global turno_var, btn_am, btn_pm, lbl_nombre_preview
     global combo_perfiles, entry_comentarios
     global lbl_status
+    global entry_pdf_caja, combo_perfiles_caja, lbl_status_caja
+    global frame_vista_reporte, frame_vista_caja
 
     ventana = ctk.CTk()
     ventana.title("Sistema Control de Stock")
@@ -528,57 +648,26 @@ def construir_ventana_principal():
     ventana.grid_columnconfigure(1, weight=1)
     ventana.grid_rowconfigure(0, weight=1)
 
-    # ── Sidebar ───────────────────────────────────────────────────────────────
-    sidebar = ctk.CTkFrame(ventana, width=200, corner_radius=0)
-    sidebar.grid(row=0, column=0, sticky="nsew")
-    sidebar.grid_propagate(False)
-    sidebar.grid_rowconfigure(5, weight=1)
-
-    # Logo en sidebar
-    if os.path.exists(ruta_png):
-        try:
-            from PIL import Image as PilImage
-            img_side = PilImage.open(ruta_png).resize((52, 52))
-            ctk_side = ctk.CTkImage(light_image=img_side, dark_image=img_side, size=(52, 52))
-            ctk.CTkLabel(sidebar, image=ctk_side, text="").grid(row=0, column=0, pady=(28, 4), padx=24)
-        except Exception:
-            ctk.CTkLabel(sidebar, text="📦", font=ctk.CTkFont(size=34)).grid(row=0, column=0, pady=(32, 2), padx=24)
-    else:
-        ctk.CTkLabel(sidebar, text="📦", font=ctk.CTkFont(size=34)).grid(row=0, column=0, pady=(32, 2), padx=24)
-
-    ctk.CTkLabel(sidebar, text="Stock\nControl",
-                 font=ctk.CTkFont(size=18, weight="bold"), justify="center").grid(
-        row=1, column=0, padx=24, pady=(0, 28))
-    ctk.CTkFrame(sidebar, height=1, fg_color=("gray75", "gray30")).grid(
-        row=2, column=0, sticky="ew", padx=16)
-
-    comandos_sidebar = {"Config": abrir_config_perfiles}
-    for idx, (icon, label) in enumerate([("📄", "Reporte"), ("📚", "Libros"), ("⚙️", "Config")]):
-        ctk.CTkButton(
-            sidebar, text=f"  {icon}  {label}", anchor="w",
-            fg_color="transparent", text_color=("gray20", "gray80"),
-            hover_color=("gray88", "gray25"), corner_radius=8, height=40,
-            command=comandos_sidebar.get(label),
-        ).grid(row=3 + idx, column=0, padx=10, pady=2, sticky="ew")
-
-    ctk.CTkLabel(sidebar, text="v1.0", font=ctk.CTkFont(size=11),
-                 text_color=("gray50", "gray50")).grid(row=6, column=0, pady=16)
-
     # ── Panel principal scrollable ─────────────────────────────────────────────
     main = ctk.CTkScrollableFrame(ventana, corner_radius=0, fg_color="transparent")
     main.grid(row=0, column=1, sticky="nsew")
     main.grid_columnconfigure(0, weight=1)
 
-    ctk.CTkLabel(main, text="Generar reporte PDF",
+    # ── Vista: Reporte (Existencia de Textos) ───────────────────────────────
+    frame_vista_reporte = ctk.CTkFrame(main, fg_color="transparent")
+    frame_vista_reporte.grid(row=0, column=0, sticky="nsew")
+    frame_vista_reporte.grid_columnconfigure(0, weight=1)
+
+    ctk.CTkLabel(frame_vista_reporte, text="Generar reporte PDF",
                  font=ctk.CTkFont(size=22, weight="bold")).grid(
         row=0, column=0, sticky="w", padx=32, pady=(32, 2))
-    ctk.CTkLabel(main,
+    ctk.CTkLabel(frame_vista_reporte,
         text="Selecciona el archivo fuente, marca las diferencias por libro y genera el PDF firmado.",
         font=ctk.CTkFont(size=12), text_color=("gray45", "gray60"),
     ).grid(row=1, column=0, sticky="w", padx=32, pady=(0, 20))
 
     # ── Card: PDF ─────────────────────────────────────────────────────────────
-    card_pdf = ctk.CTkFrame(main, corner_radius=12)
+    card_pdf = ctk.CTkFrame(frame_vista_reporte, corner_radius=12)
     card_pdf.grid(row=2, column=0, sticky="ew", padx=32, pady=(0, 14))
     card_pdf.grid_columnconfigure(1, weight=1)
     ctk.CTkLabel(card_pdf, text="ARCHIVO FUENTE",
@@ -592,7 +681,7 @@ def construir_ventana_principal():
                   command=seleccionar_pdf).grid(row=1, column=2, padx=(0, 20), pady=(0, 16))
 
     # ── Card: Libros ──────────────────────────────────────────────────────────
-    card_libros = ctk.CTkFrame(main, corner_radius=12)
+    card_libros = ctk.CTkFrame(frame_vista_reporte, corner_radius=12)
     card_libros.grid(row=3, column=0, sticky="ew", padx=32, pady=(0, 14))
     card_libros.grid_columnconfigure(0, weight=1)
     header_libros = ctk.CTkFrame(card_libros, fg_color="transparent")
@@ -615,7 +704,7 @@ def construir_ventana_principal():
     frame_libros.grid(row=1, column=0, sticky="ew", padx=20, pady=(0, 16))
 
     # ── Card: Turno AM / PM ───────────────────────────────────────────────────
-    card_turno = ctk.CTkFrame(main, corner_radius=12)
+    card_turno = ctk.CTkFrame(frame_vista_reporte, corner_radius=12)
     card_turno.grid(row=4, column=0, sticky="ew", padx=32, pady=(0, 14))
     card_turno.grid_columnconfigure(0, weight=1)
     ctk.CTkLabel(card_turno, text="TURNO",
@@ -646,7 +735,7 @@ def construir_ventana_principal():
     lbl_nombre_preview.grid(row=2, column=0, sticky="w", padx=20, pady=(0, 16))
 
     # ── Card: Perfil + Comentarios ────────────────────────────────────────────
-    card_opciones = ctk.CTkFrame(main, corner_radius=12)
+    card_opciones = ctk.CTkFrame(frame_vista_reporte, corner_radius=12)
     card_opciones.grid(row=5, column=0, sticky="ew", padx=32, pady=(0, 14))
     card_opciones.grid_columnconfigure(0, weight=1)
     ctk.CTkLabel(card_opciones, text="PERFIL",
@@ -671,7 +760,7 @@ def construir_ventana_principal():
     entry_comentarios.grid(row=4, column=0, sticky="ew", padx=20, pady=(0, 20))
 
     lbl_status = ctk.CTkLabel(
-        main, text="",
+        frame_vista_reporte, text="",
         font=ctk.CTkFont(size=12),
         text_color="#86efac",
     )
@@ -679,10 +768,102 @@ def construir_ventana_principal():
 
     # ── Botón generar ─────────────────────────────────────────────────────────
     ctk.CTkButton(
-        main, text="  Generar PDF  →",
+        frame_vista_reporte, text="  Generar PDF  →",
         font=ctk.CTkFont(size=15, weight="bold"),
         height=52, corner_radius=12, command=generar_pdf,
     ).grid(row=7, column=0, sticky="e", padx=32, pady=(4, 40))
+
+    # ── Vista: Caja (Reporte de Caja Detallado) ─────────────────────────────
+    frame_vista_caja = ctk.CTkFrame(main, fg_color="transparent")
+    frame_vista_caja.grid_columnconfigure(0, weight=1)
+    # No se hace .grid() todavía: arranca oculta, se muestra desde el sidebar.
+
+    ctk.CTkLabel(frame_vista_caja, text="Firmar Reporte de Caja",
+                 font=ctk.CTkFont(size=22, weight="bold")).grid(
+        row=0, column=0, sticky="w", padx=32, pady=(32, 2))
+    ctk.CTkLabel(frame_vista_caja,
+        text="Selecciona el Reporte de Caja Detallado y el perfil para firmarlo.",
+        font=ctk.CTkFont(size=12), text_color=("gray45", "gray60"),
+    ).grid(row=1, column=0, sticky="w", padx=32, pady=(0, 20))
+
+    card_caja = ctk.CTkFrame(frame_vista_caja, corner_radius=12)
+    card_caja.grid(row=2, column=0, sticky="ew", padx=32, pady=(0, 14))
+    card_caja.grid_columnconfigure(1, weight=1)
+    ctk.CTkLabel(card_caja, text="ARCHIVO FUENTE",
+                 font=ctk.CTkFont(size=10, weight="bold"),
+                 text_color=("gray50", "gray50")).grid(
+        row=0, column=0, columnspan=3, sticky="w", padx=20, pady=(16, 6))
+    entry_pdf_caja = ctk.CTkEntry(card_caja, placeholder_text="Ruta del Reporte de Caja…",
+                                   height=40, corner_radius=8)
+    entry_pdf_caja.grid(row=1, column=0, columnspan=2, sticky="ew", padx=(20, 8), pady=(0, 16))
+    ctk.CTkButton(card_caja, text="Buscar", width=110, height=40, corner_radius=8,
+                  command=lambda: seleccionar_pdf_generico(entry_pdf_caja)).grid(
+        row=1, column=2, padx=(0, 20), pady=(0, 16))
+
+    card_perfil_caja = ctk.CTkFrame(frame_vista_caja, corner_radius=12)
+    card_perfil_caja.grid(row=3, column=0, sticky="ew", padx=32, pady=(0, 14))
+    card_perfil_caja.grid_columnconfigure(0, weight=1)
+    ctk.CTkLabel(card_perfil_caja, text="PERFIL",
+                 font=ctk.CTkFont(size=10, weight="bold"),
+                 text_color=("gray50", "gray50")).grid(
+        row=0, column=0, sticky="w", padx=20, pady=(16, 6))
+    combo_perfiles_caja = ctk.CTkOptionMenu(
+        card_perfil_caja, values=list(PERFILES.keys()),
+        height=40, corner_radius=8, dynamic_resizing=False)
+    combo_perfiles_caja.grid(row=1, column=0, sticky="ew", padx=20, pady=(0, 16))
+
+    lbl_status_caja = ctk.CTkLabel(
+        frame_vista_caja, text="",
+        font=ctk.CTkFont(size=12),
+        text_color="#86efac",
+    )
+    lbl_status_caja.grid(row=4, column=0, sticky="e", padx=32, pady=(4, 0))
+
+    ctk.CTkButton(
+        frame_vista_caja, text="  Firmar y guardar  →",
+        font=ctk.CTkFont(size=15, weight="bold"),
+        height=52, corner_radius=12, command=generar_pdf_caja,
+    ).grid(row=5, column=0, sticky="e", padx=32, pady=(4, 40))
+
+    # ── Sidebar ───────────────────────────────────────────────────────────────
+    sidebar = ctk.CTkFrame(ventana, width=200, corner_radius=0)
+    sidebar.grid(row=0, column=0, sticky="nsew")
+    sidebar.grid_propagate(False)
+    sidebar.grid_rowconfigure(5, weight=1)
+
+    # Logo en sidebar
+    if os.path.exists(ruta_png):
+        try:
+            from PIL import Image as PilImage
+            img_side = PilImage.open(ruta_png).resize((52, 52))
+            ctk_side = ctk.CTkImage(light_image=img_side, dark_image=img_side, size=(52, 52))
+            ctk.CTkLabel(sidebar, image=ctk_side, text="").grid(row=0, column=0, pady=(28, 4), padx=24)
+        except Exception:
+            ctk.CTkLabel(sidebar, text="📦", font=ctk.CTkFont(size=34)).grid(row=0, column=0, pady=(32, 2), padx=24)
+    else:
+        ctk.CTkLabel(sidebar, text="📦", font=ctk.CTkFont(size=34)).grid(row=0, column=0, pady=(32, 2), padx=24)
+
+    ctk.CTkLabel(sidebar, text="Stock\nControl",
+                 font=ctk.CTkFont(size=18, weight="bold"), justify="center").grid(
+        row=1, column=0, padx=24, pady=(0, 28))
+    ctk.CTkFrame(sidebar, height=1, fg_color=("gray75", "gray30")).grid(
+        row=2, column=0, sticky="ew", padx=16)
+
+    comandos_sidebar = {
+        "Reporte": lambda: mostrar_vista("Reporte"),
+        "Caja":    lambda: mostrar_vista("Caja"),
+        "Config":  abrir_config_perfiles,
+    }
+    for idx, (icon, label) in enumerate([("📄", "Reporte"), ("💵", "Caja"), ("⚙️", "Config")]):
+        ctk.CTkButton(
+            sidebar, text=f"  {icon}  {label}", anchor="w",
+            fg_color="transparent", text_color=("gray20", "gray80"),
+            hover_color=("gray88", "gray25"), corner_radius=8, height=40,
+            command=comandos_sidebar.get(label),
+        ).grid(row=3 + idx, column=0, padx=10, pady=2, sticky="ew")
+
+    ctk.CTkLabel(sidebar, text="v1.0", font=ctk.CTkFont(size=11),
+                 text_color=("gray50", "gray50")).grid(row=6, column=0, pady=16)
 
     return ventana
 
