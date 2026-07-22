@@ -13,16 +13,10 @@ jobs:
         with:
           python-version: "3.11"
 
-      - run: >
-          pyinstaller --onefile --windowed
-          Existencia_Textos.py
+      - run: pip install customtkinter pdfplumber reportlab PyPDF2 Pillow pyinstaller
 
       - run: >
           pyinstaller --onefile --windowed
-          --icon=Icono.ico
-          --add-data "Icono.ico;."
-          --add-data "Icono.png;."
-          --add-data "Firmas;Firmas"
           Existencia_Textos.py
 
       - uses: actions/upload-artifact@v4
