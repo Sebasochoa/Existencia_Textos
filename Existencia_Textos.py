@@ -227,6 +227,11 @@ def escribir_sobre_pdf(ruta_pdf, salida_pdf, excepciones, perfil_id, comentario)
 # al costado del cuadro "RESUMEN FINAL PARA EL ÁREA DE CONTABILIDAD", que siempre
 # está presente y es el punto más fiable de anclar (a diferencia de "Leyenda",
 # que puede quedar muy abajo si el reporte tiene muchas filas).
+#
+# El reporte puede tener más de una página (varía según la cantidad de cobros
+# del día); el resumen, la leyenda y por lo tanto la firma y los comentarios
+# siempre van en la última página, así que todo el anclaje se hace sobre
+# pdf.pages[-1] / original.pages[-1].
 
 def obtener_iniciales(nombre):
     return "".join(p[0].upper() for p in nombre.split() if p)
@@ -248,7 +253,18 @@ def obtener_bloque_firma_caja(ruta_pdf):
         x_derecho  = max(p["x1"] for p in banda)
         return {"x": x_derecho + 20, "y": pagina.height - top_cabecera}
 
-def firmar_reporte_caja(ruta_pdf, salida_pdf, perfil_id):
+def obtener_y_leyenda(ruta_pdf):
+    """Ubica la línea 'Leyenda:' en la última página del Reporte de Caja
+    para escribir los comentarios justo debajo. Si no la encuentra,
+    devuelve None y el llamador usa un fallback."""
+    with pdfplumber.open(ruta_pdf) as pdf:
+        pagina = pdf.pages[-1]
+        for palabra in pagina.extract_words():
+            if palabra["text"].startswith("Leyenda"):
+                return pagina.height - palabra["bottom"]
+    return None
+
+def firmar_reporte_caja(ruta_pdf, salida_pdf, perfil_id, comentario=""):
     perfil = PERFILES.get(perfil_id)
     if not perfil:
         raise ValueError("Perfil no encontrado")
@@ -278,6 +294,20 @@ def firmar_reporte_caja(ruta_pdf, salida_pdf, perfil_id):
     can.setFont("Helvetica", 7)
     can.setFillColor(colors_mod.grey)
     can.drawString(x, y - 58, "Nombre y Firma")
+
+    # Comentarios: se ubican debajo de la línea "Leyenda:" de la última página.
+    if comentario:
+        y_leyenda     = obtener_y_leyenda(ruta_pdf)
+        y_comentario  = (y_leyenda - 18) if y_leyenda is not None else 40  # fallback si no se detecta
+        can.setFillColor(colors_mod.black)
+        can.setFont("Helvetica-Bold", 8)
+        can.drawString(20, y_comentario, "Comentarios:")
+        can.setFont("Helvetica", 8)
+        yy = y_comentario - 12
+        for parrafo in comentario.splitlines():
+            for linea in textwrap.wrap(parrafo, width=140) or [""]:
+                can.drawString(20, yy, linea)
+                yy -= 11
 
     can.save()
     packet.seek(0)
@@ -529,8 +559,9 @@ def generar_pdf_caja():
     if pdfplumber is None:
         messagebox.showwarning("Espera", "Las librerias aun se estan cargando, intentá en unos segundos.")
         return
-    ruta_pdf  = entry_pdf_caja.get()
-    perfil_id = combo_perfiles_caja.get()
+    ruta_pdf   = entry_pdf_caja.get()
+    perfil_id  = combo_perfiles_caja.get()
+    comentario = entry_comentarios_caja.get("1.0", "end").strip()
     if not ruta_pdf:
         messagebox.showerror("Error", "Seleccione un PDF")
         return
@@ -551,7 +582,7 @@ def generar_pdf_caja():
     if not nombre_salida:
         return
 
-    firmar_reporte_caja(ruta_pdf, nombre_salida, perfil_id)
+    firmar_reporte_caja(ruta_pdf, nombre_salida, perfil_id, comentario)
     lbl_status_caja.configure(
         text=f"✔  PDF guardado: {os.path.basename(nombre_salida)}",
         text_color="#86efac"
@@ -619,7 +650,7 @@ def construir_ventana_principal():
     global turno_var, btn_am, btn_pm, lbl_nombre_preview
     global combo_perfiles, entry_comentarios
     global lbl_status
-    global entry_pdf_caja, combo_perfiles_caja, lbl_status_caja
+    global entry_pdf_caja, combo_perfiles_caja, entry_comentarios_caja, lbl_status_caja
     global frame_vista_reporte, frame_vista_caja
 
     ventana = ctk.CTk()
@@ -811,6 +842,17 @@ def construir_ventana_principal():
         card_perfil_caja, values=list(PERFILES.keys()),
         height=40, corner_radius=8, dynamic_resizing=False)
     combo_perfiles_caja.grid(row=1, column=0, sticky="ew", padx=20, pady=(0, 16))
+    ctk.CTkFrame(card_perfil_caja, height=1, fg_color=("gray80", "gray30")).grid(
+        row=2, column=0, sticky="ew", padx=20)
+    ctk.CTkLabel(card_perfil_caja, text="COMENTARIOS",
+                 font=ctk.CTkFont(size=10, weight="bold"),
+                 text_color=("gray50", "gray50")).grid(
+        row=3, column=0, sticky="w", padx=20, pady=(16, 6))
+    entry_comentarios_caja = ctk.CTkTextbox(
+        card_perfil_caja, height=90, corner_radius=8,
+        wrap="word",
+    )
+    entry_comentarios_caja.grid(row=4, column=0, sticky="ew", padx=20, pady=(0, 20))
 
     lbl_status_caja = ctk.CTkLabel(
         frame_vista_caja, text="",
